@@ -6,7 +6,6 @@ from typing import Union, List
 import torch
 from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-from tqdm import tqdm
 
 from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
@@ -17,11 +16,6 @@ try:
     BICUBIC = InterpolationMode.BICUBIC
 except ImportError:
     BICUBIC = Image.BICUBIC
-
-
-if version.parse(torch.__version__) < version.parse("1.7.1"):
-    warnings.warn("PyTorch version 1.7.1 or higher is recommended")
-
 
 __all__ = ["available_models", "load", "tokenize"]
 _tokenizer = _Tokenizer()
@@ -89,85 +83,15 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     else:
         raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
 
+
+    # must using jit.load to load model
     with open(model_path, 'rb') as opened_file:
-        try:
-            # loading JIT archive
-            model = torch.jit.load(opened_file, map_location=device if jit else "cpu").eval()
-            state_dict = None
-        except RuntimeError:
-            # loading saved state dict
-            if jit:
-                warnings.warn(f"File {model_path} is not a JIT archive. Loading as a state dict instead")
-                jit = False
-            # state_dict = torch.load(opened_file, map_location="cpu")
-            state_dict = torch.load(opened_file)
+        model = torch.jit.load(opened_file, map_location=device if jit else "cpu").eval()
 
-
-    if not jit:
-        model = build_model(state_dict or model.state_dict()).to(device)
-        if str(device) == "cpu":
-            model.float()
-        return model, _transform(model.visual.input_resolution)
-
-    # patch the device names
-    device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])
-    device_node = [n for n in device_holder.graph.findAllNodes("prim::Constant") if "Device" in repr(n)][-1]
-
-    def _node_get(node: torch._C.Node, key: str):
-        """Gets attributes of a node which is polymorphic over return type.
-        
-        From https://github.com/pytorch/pytorch/pull/82628
-        """
-        sel = node.kindOf(key)
-        return getattr(node, sel)(key)
-
-    def patch_device(module):
-        try:
-            graphs = [module.graph] if hasattr(module, "graph") else []
-        except RuntimeError:
-            graphs = []
-
-        if hasattr(module, "forward1"):
-            graphs.append(module.forward1.graph)
-
-        for graph in graphs:
-            for node in graph.findAllNodes("prim::Constant"):
-                if "value" in node.attributeNames() and str(_node_get(node, "value")).startswith("cuda"):
-                    node.copyAttributes(device_node)
-
-    model.apply(patch_device)
-    patch_device(model.encode_image)
-    patch_device(model.encode_text)
-
-    # patch dtype to float32 on CPU
+    model = build_model(model.state_dict()).to(device)
     if str(device) == "cpu":
-        float_holder = torch.jit.trace(lambda: torch.ones([]).float(), example_inputs=[])
-        float_input = list(float_holder.graph.findNode("aten::to").inputs())[1]
-        float_node = float_input.node()
-
-        def patch_float(module):
-            try:
-                graphs = [module.graph] if hasattr(module, "graph") else []
-            except RuntimeError:
-                graphs = []
-
-            if hasattr(module, "forward1"):
-                graphs.append(module.forward1.graph)
-
-            for graph in graphs:
-                for node in graph.findAllNodes("aten::to"):
-                    inputs = list(node.inputs())
-                    for i in [1, 2]:  # dtype can be the second or third argument to aten::to()
-                        if _node_get(inputs[i].node(), "value") == 5:
-                            inputs[i].node().copyAttributes(float_node)
-
-        model.apply(patch_float)
-        patch_float(model.encode_image)
-        patch_float(model.encode_text)
-
         model.float()
-
-    return model, _transform(model.input_resolution.item())
+    return model, _transform(model.visual.input_resolution)
 
 
 def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: bool = False) -> Union[torch.IntTensor, torch.LongTensor]:
