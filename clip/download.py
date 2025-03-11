@@ -2,7 +2,7 @@ import os
 import hashlib
 import warnings
 import urllib
-import tqdm
+from tqdm import tqdm
 
 def _download(url: str, root: str):
     os.makedirs(root, exist_ok=True)
