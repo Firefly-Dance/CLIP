@@ -7,7 +7,9 @@ import warnings
 # for model_name in model_name_list:
 
 if True:
-    model_name = 'RN50'
+    # model_name = 'RN50'
+    model_name = 'ViT-B/32'
+
     warnings.warn(f"Using model {model_name}")
     device = "cuda:0"
 
