@@ -3,9 +3,170 @@ from typing import Tuple, Union
 import numpy as np
 import torch
 from torch import nn
+import torch.functional as F
 
 from .atom_module import AttentionPool2d,Bottleneck,LayerNorm,QuickGELU
-from .molecule_module import ModifiedResNet
+from .molecule_module import ModifiedResNet,Transformer,VisionTransformer,Lambda
+
+
+class ModularCLIP_ResNet(nn.Module):
+    def __init__(self, embed_dim: int, image_resolution: int, vision_layers: Union[Tuple[int, int, int, int], int],
+                 vision_width: int, vision_patch_size: int, context_length: int, vocab_size: int,
+                 transformer_width: int, transformer_heads: int, transformer_layers: int):
+        super().__init__()
+        
+        # 初始化视觉和文本的模块列表
+        self.vision_stages = nn.ModuleList()
+        self.text_stages = nn.ModuleList()
+        
+        # 构建视觉处理流
+        self._build_visual_modules(
+            embed_dim, image_resolution, vision_layers,
+            vision_width, vision_patch_size
+        )
+        
+        # 构建文本处理流
+        self._build_text_modules(
+            context_length, vocab_size, transformer_width,
+            transformer_heads, transformer_layers, embed_dim
+        )
+        
+        # 共享参数
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.initialize_parameters()
+
+    def _build_visual_modules(self, embed_dim, image_resolution, vision_layers, vision_width, vision_patch_size):
+        """构建可分段执行的视觉模块序列"""
+        vision_heads = vision_width * 32 // 64
+        resnet = ModifiedResNet(
+            layers=vision_layers,
+            output_dim=embed_dim,
+            heads=vision_heads,
+            input_resolution=image_resolution,
+            width=vision_width
+        )
+        
+        # 分解ResNet为模块化组件
+        self.vision_stages.extend([
+            nn.Sequential(
+                resnet.conv1,
+                resnet.bn1,
+                resnet.relu,
+                resnet.maxpool
+            ),
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3,
+            resnet.layer4,
+            resnet.attnpool if hasattr(resnet, 'attnpool') else Lambda(lambda x: x)
+        ])
+
+    def _build_text_modules(self, context_length, vocab_size, transformer_width, 
+                          transformer_heads, transformer_layers, embed_dim):
+        """构建可分段执行的文本模块序列"""
+        self.text_stages.extend([
+            # Stage 0: 文本嵌入
+            nn.Sequential(
+                nn.Embedding(vocab_size, transformer_width),
+                Lambda(lambda x: x + self.positional_embedding)
+            ),
+            
+            # Stage 1: Transformer输入调整
+            Lambda(lambda x: x.permute(1, 0, 2)),
+            
+            # Stage 2: Transformer主体
+            Transformer(
+                width=transformer_width,
+                layers=transformer_layers,
+                heads=transformer_heads,
+                attn_mask=self.build_attention_mask()
+            ),
+            
+            # Stage 3: 输出调整
+            Lambda(lambda x: x.permute(1, 0, 2)),
+            
+            # Stage 4: 最终处理
+            nn.Sequential(
+                LayerNorm(transformer_width),
+                Lambda(lambda x: x[torch.arange(x.shape[0]), self._get_eot_positions(x)]),
+                nn.Linear(transformer_width, embed_dim, bias=False)
+            )
+        ])
+        
+        # 注册文本专用参数
+        self.register_parameter('positional_embedding', 
+                               nn.Parameter(torch.empty(context_length, transformer_width)))
+        self._eot_token_id = vocab_size - 1  # 假设最后一个token是EOS
+
+    def _get_eot_positions(self, x):
+        """动态获取每个序列的结束位置"""
+        return torch.argmax(self.text_stages[0][0].weight, dim=0)[-1].expand(x.size(0))
+
+    def encode_image(self, image, start: int = 0, end: int = None):
+        """分段执行视觉处理"""
+        x = image.type(self.dtype)
+        end = end if end is not None else len(self.vision_stages)
+        
+        for stage in self.vision_stages[start:end]:
+            x = stage(x)
+        return x
+
+    def encode_text(self, text, start: int = 0, end: int = None):
+        """分段执行文本处理"""
+        x = text
+        end = end if end is not None else len(self.text_stages)
+        
+        for stage in self.text_stages[start:end]:
+            x = stage(x)
+        return x
+
+    def forward(self, image, text):
+        # 图像特征提取
+        img_features = self.encode_image(image)
+        img_features = F.normalize(img_features, p=2, dim=-1)
+        
+        # 文本特征提取
+        txt_features = self.encode_text(text)
+        txt_features = F.normalize(txt_features, p=2, dim=-1)
+        
+        # 计算相似度
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = logit_scale * img_features @ txt_features.t()
+        logits_per_text = logits_per_image.t()
+        
+        return logits_per_image, logits_per_text
+
+    # 保持原有初始化方法和属性
+    def build_attention_mask(self):
+        mask = torch.empty(self.context_length, self.context_length)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)
+        return mask
+
+    @property
+    def dtype(self):
+        return next(self.vision_stages[0].parameters()).dtype
+
+    def initialize_parameters(self):
+        # 文本嵌入初始化
+        nn.init.normal_(self.text_stages[0][0].weight, std=0.02)
+        nn.init.normal_(self.positional_embedding, std=0.01)
+        
+        # 视觉部分初始化保持原逻辑
+        for resnet_block in self.vision_stages[1:-1]:  # 跳过首尾特殊处理
+            for name, param in resnet_block.named_parameters():
+                if name.endswith("bn3.weight"):
+                    nn.init.zeros_(param)
+        
+        # Transformer初始化
+        text_transformer = self.text_stages[2]
+        proj_std = (text_transformer.width ** -0.5) * ((2 * text_transformer.layers) ** -0.5)
+        attn_std = text_transformer.width ** -0.5
+        for block in text_transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=attn_std)
+
 
 
 class CLIP_ResNet(nn.Module):

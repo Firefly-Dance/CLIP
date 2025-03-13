@@ -1,43 +1,7 @@
 # 意为可分割的module层，用来放ModuleList化的atom module
 import torch
 from torch import nn
-from torch.functional import 
-from .atom_module import AttentionPool2d,Bottleneck,ResidualAttentionBlock,LayerNorm
-
-# 自定义张量操作模块
-class TensorReshape(nn.Module):
-    def __init__(self, shape):
-        super().__init__()
-        self.shape = shape  # 使用元组定义目标形状
-    
-    def forward(self, x):
-        return x.reshape(*self.shape)
-    
-    def __repr__(self):
-        return f"TensorReshape(shape={self.shape})"
-class TensorPermute(nn.Module):
-    def __init__(self, dims):
-        super().__init__()
-        self.dims = dims  # 维度排列顺序
-    
-    def forward(self, x):
-        return x.permute(*self.dims)
-    
-    def __repr__(self):
-        return f"TensorPermute(dims={self.dims})"
-class Lambda(nn.Module):
-    """将任意函数转换为可序列化的 PyTorch 模块"""
-    def __init__(self, func):
-        super().__init__()
-        self.func = func
-
-    def forward(self, x):
-        return self.func(x)
-
-    def __repr__(self):
-        return f"Lambda(func={self.func})"
-
-
+from .atom_module import AttentionPool2d,Bottleneck,ResidualAttentionBlock,LayerNorm,Lambda,TensorReshape,TensorPermute
 
 #  Helper Function
 def sequential_to_modulelist(sequential: nn.Sequential) -> nn.ModuleList:
@@ -215,6 +179,7 @@ class VisionTransformer(nn.Module):
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
         # add
         grid_size = input_resolution // patch_size
         # 构建模块列表
@@ -260,7 +225,8 @@ class VisionTransformer(nn.Module):
             # Stage 9: 最终投影
             ConditionalProjection(width, output_dim)
         ])
-
+    def ModuleList(self):
+        return self.stages
 
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
