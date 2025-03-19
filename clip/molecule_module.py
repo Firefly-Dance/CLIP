@@ -1,7 +1,9 @@
 # 意为可分割的module层，用来放ModuleList化的atom module
 import torch
 from torch import nn
-from .atom_module import AttentionPool2d,Bottleneck,ResidualAttentionBlock,LayerNorm,Lambda,TensorReshape,TensorPermute
+from atom_module import AttentionPool2d,Bottleneck,ResidualAttentionBlock,LayerNorm,TensorReshape,TensorPermute
+import torch.nn.functional as F
+from torch.nn import MultiheadAttention
 
 #  Helper Function
 def sequential_to_modulelist(sequential: nn.Sequential) -> nn.ModuleList:
@@ -123,11 +125,42 @@ class Transformer(nn.Module):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.resblocks = nn.ModuleList([
+            ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)
+        ])
 
     def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
-    # added 
+        # 确保所有块使用相同的数据类型和设备
+        dtype = x.dtype
+        device = x.device
+        for block in self.resblocks:
+            # 确保每个块的输入和权重数据类型和设备匹配
+            x = block(x.to(dtype=dtype, device=device))
+        return x
+
+    def _convert_weights(self, dtype):
+        """将模块的权重转换为指定的数据类型"""
+        def _convert(m):
+            if isinstance(m, (nn.Linear, nn.LayerNorm)):
+                m.weight.data = m.weight.data.to(dtype)
+                if m.bias is not None:
+                    m.bias.data = m.bias.data.to(dtype)
+            elif isinstance(m, nn.MultiheadAttention):
+                # 转换多头注意力层的权重
+                for attr in ['in_proj_weight', 'out_proj.weight']:
+                    if hasattr(m, attr.split('.')[0]):
+                        weight = getattr(m, attr.split('.')[0])
+                        if isinstance(weight, nn.Parameter):
+                            weight.data = weight.data.to(dtype)
+                # 转换偏置
+                for attr in ['in_proj_bias', 'out_proj.bias']:
+                    if hasattr(m, attr.split('.')[0]):
+                        bias = getattr(m, attr.split('.')[0])
+                        if isinstance(bias, nn.Parameter):
+                            bias.data = bias.data.to(dtype)
+        
+        self.apply(_convert)
+
     def ModuleList(self):
         return sequential_to_modulelist(self.resblocks)
     
@@ -180,55 +213,11 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-        # add
-        grid_size = input_resolution // patch_size
-        # 构建模块列表
-        self.stages = nn.ModuleList([
-            # Stage 0: 分块嵌入
-            nn.Sequential(
-                nn.Conv2d(3, width, patch_size, patch_size, bias=False),
-                TensorReshape((-1, width, grid_size**2)),  # 保持 batch 维度
-                TensorPermute((0, 2, 1))  # [B, grid^2, width]
-            ),
-            
-            # Stage 1: 添加类别嵌入
-            nn.Sequential(
-                Lambda(lambda x: torch.cat([
-                    torch.zeros(x.size(0), 1, x.size(-1), 
-                               dtype=x.dtype, device=x.device), 
-                    x
-                ], dim=1)),  # 占位符操作
-                AddClassToken(width)  # 实际添加可学习 token
-            ),
-            
-            # Stage 2: 位置编码
-            AddPositionalEncoding((grid_size**2 + 1, width)),
-            
-            # Stage 3: 预处理归一化
-            LayerNorm(width),
-            
-            # Stage 4: Transformer 输入调整
-            TensorPermute((1, 0, 2)),  # [N, B, C]
-            
-            # Stage 5: Transformer 主体
-            Transformer(width, layers, heads),
-            
-            # Stage 6: 输出调整
-            TensorPermute((1, 0, 2)),  # [B, N, C]
-            
-            # Stage 7: 取类别标记
-            Lambda(lambda x: x[:, 0, :]),  # 核心操作
-            
-            # Stage 8: 后处理归一化
-            LayerNorm(width),
-            
-            # Stage 9: 最终投影
-            ConditionalProjection(width, output_dim)
-        ])
-    def ModuleList(self):
-        return self.stages
-
     def forward(self, x: torch.Tensor):
+        # 确保输入和权重的数据类型匹配
+        dtype = self.conv1.weight.dtype
+        x = x.to(dtype)
+        
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -243,7 +232,71 @@ class VisionTransformer(nn.Module):
         x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:
-            x = x @ self.proj
+            # 确保x和self.proj的数据类型匹配
+            x = x @ self.proj.to(x.dtype)
 
+        return x
+
+class Lambda(nn.Module):
+    def __init__(self, func):
+        super().__init__()
+        self.func = func
+        
+    def forward(self, x):
+        return self.func(x)
+
+class EosExtractor(nn.Module):
+    """提取[EOS]位置的特征"""
+    def forward(self, x, text):
+        # 找到每个序列中[EOS]标记的位置
+        # 假设[EOS]是序列中的最后一个非零标记
+        if text.dim() > 1:
+            # 如果text是token序列，找到每个序列中最后一个非零token的位置
+            eos_indices = text.ne(0).sum(dim=1) - 1
+            # 确保索引不会越界
+            eos_indices = torch.clamp(eos_indices, min=0, max=text.size(1)-1)
+        else:
+            # 如果text已经是索引，直接使用
+            eos_indices = text
+        
+        # 提取每个序列中[EOS]位置的特征
+        return x[torch.arange(x.shape[0], device=x.device), eos_indices]
+
+class LayerNorm(nn.LayerNorm):
+    """LayerNorm但具有可选的权重和偏置。不添加偏置，如果已经提供了偏置。"""
+    def __init__(self, hidden_size, eps=1e-5):
+        super().__init__(hidden_size, eps)
+        self.weight.data.fill_(1.0)
+        
+class QuickGELU(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x * torch.sigmoid(1.702 * x)
+
+class MLP(nn.Module):
+    def __init__(self, d_model: int, d_out: int):
+        super().__init__()
+        self.c_fc = nn.Linear(d_model, d_model * 4)
+        self.gelu = QuickGELU()
+        self.c_proj = nn.Linear(d_model * 4, d_out)
+    
+    def forward(self, x: torch.Tensor):
+        return self.c_proj(self.gelu(self.c_fc(x)))
+
+class ResidualAttentionBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = MLP(d_model, d_model)
+        self.ln_2 = LayerNorm(d_model)
+        self.attn_mask = attn_mask
+
+    def attention(self, x: torch.Tensor):
+        return self.attn(x, x, x, need_weights=False)[0]
+
+    def forward(self, x: torch.Tensor):
+        x = x + self.attention(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 

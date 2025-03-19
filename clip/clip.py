@@ -7,9 +7,9 @@ import torch
 from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 
-from .model import build_model
-from .simple_tokenizer import SimpleTokenizer as _Tokenizer
-from .download import _download
+from model import build_model
+from simple_tokenizer import SimpleTokenizer as _Tokenizer
+from download import _download
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -83,14 +83,28 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     else:
         raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
 
+    try:
+        # loading JIT archive
+        model = torch.jit.load(model_path, map_location=device if jit else "cpu").eval()
+        state_dict = None
+    except RuntimeError:
+        # loading saved state dict
+        if jit:
+            warnings.warn(f"File {model_path} is not a JIT archive. Loading as a state dict instead")
+            jit = False
+        state_dict = torch.load(model_path, map_location="cpu")
 
-    # must using jit.load to load model
-    with open(model_path, 'rb') as opened_file:
-        model = torch.jit.load(opened_file, map_location=device if jit else "cpu").eval()
+    if not jit:
+        try:
+            model = build_model(state_dict or model.state_dict()).to(device)
+        except KeyError as e:
+            print(f"Error loading state_dict: {e}")
+            print("Available keys in state_dict:", list(state_dict.keys())[:10], "...")
+            raise
 
-    model = build_model(model.state_dict()).to(device)
     if str(device) == "cpu":
         model.float()
+
     return model, _transform(model.visual.input_resolution)
 
 
