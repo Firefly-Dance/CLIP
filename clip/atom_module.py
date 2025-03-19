@@ -90,12 +90,23 @@ class Bottleneck(nn.Module):
         return out
     
 class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16."""
+    """LayerNorm but with an optional bias and automatic dtype conversion"""
+    def __init__(self, ndim, bias=True):
+        super().__init__(ndim, elementwise_affine=True)
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, x: torch.Tensor):
-        orig_type = x.dtype
-        ret = super().forward(x.type(torch.float32))
-        return ret.type(orig_type)
+    def forward(self, x):
+        # 确保权重和偏置的类型与输入相匹配
+        weight = self.weight.to(dtype=x.dtype)
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        
+        return F.layer_norm(
+            x,
+            self.normalized_shape,
+            weight,
+            bias,
+            self.eps
+        )
 
 # --- ViT Atom Module ---
 
@@ -136,13 +147,22 @@ class Lambda(nn.Module):
 
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
-        return x * torch.sigmoid(1.702 * x)
+        # 保存输入的原始数据类型
+        original_dtype = x.dtype
+        
+        # 如果需要，转换为浮点型进行计算
+        if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
+            x_float = x.float()
+            result = x_float * torch.sigmoid(1.702 * x_float)
+            # 转回原始数据类型
+            return result.to(original_dtype)
+        else:
+            return x * torch.sigmoid(1.702 * x)
     
 
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
-
         self.attn = nn.MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
@@ -154,11 +174,58 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        # 获取输入的形状信息
+        seq_len, batch_size, _ = x.shape
+        
+        # 确保权重和输入的数据类型一致
+        weight_dtype = self.attn.in_proj_weight.dtype
+        if x.dtype != weight_dtype:
+            x = x.to(weight_dtype)
+        
+        # 创建因果掩码
+        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1)
+        mask = mask.to(device=x.device, dtype=x.dtype)
+        
+        # 使用显式掩码，不使用 is_causal 参数
+        return self.attn(
+            x, x, x,
+            need_weights=False,
+            attn_mask=mask,
+            key_padding_mask=None
+        )[0]
 
     def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # 确保输入和权重的数据类型一致
+        weight_dtype = self.ln_1.weight.dtype
+        x = x.to(weight_dtype)
+        
+        # 应用自注意力
+        x_ln = self.ln_1(x)
+        attention_out = self.attention(x_ln)
+        x = x + attention_out
+        
+        # 应用 MLP - 确保数据类型一致
+        x_ln = self.ln_2(x)
+        
+        # 获取 MLP 的第一个线性层的权重类型
+        mlp_dtype = self.mlp[0].weight.dtype
+        x_ln = x_ln.to(mlp_dtype)
+        
+        # 应用 MLP 并确保输出与输入 x 的数据类型一致
+        mlp_out = self.mlp(x_ln).to(weight_dtype)
+        x = x + mlp_out
+        
         return x
+
+    def _ensure_mlp_dtype_consistency(self):
+        """确保 MLP 中所有层的数据类型一致"""
+        # 获取第一个线性层的数据类型
+        first_dtype = next(self.mlp[0].parameters()).dtype
+        
+        # 确保所有层使用相同的数据类型
+        for module in self.mlp.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.data = module.weight.data.to(first_dtype)
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(first_dtype)
 
